@@ -1,0 +1,33 @@
+{
+  "title": "Sim Search",
+  "pages": [
+    "---User guides---",
+    "quickstart",
+    "find-content",
+    "ask-questions",
+    "sim-links",
+    "!people",
+    "troubleshooting",
+    "---Connect sources---",
+    "connect-your-account",
+    "coda",
+    "confluence",
+    "fireflies",
+    "github",
+    "gitlab",
+    "gmail",
+    "google-calendar",
+    "google-drive",
+    "google-meet",
+    "granola",
+    "hubspot",
+    "jira",
+    "linear",
+    "lucid",
+    "notion",
+    "slack",
+    "zoom",
+    "mcp",
+    "generic-secrets"
+  ]
+}

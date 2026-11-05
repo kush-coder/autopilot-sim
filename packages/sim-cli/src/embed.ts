@@ -1,0 +1,260 @@
+import { getErrorMessage } from '@sim/utils/errors'
+import { type Command, CommanderError, type OutputConfiguration } from 'commander'
+import { ProfileConfigError } from './config/index'
+import {
+  type EmbedContext,
+  type EmbeddedCliIdentity,
+  EmbeddedExit,
+  type EmbeddedFileSnapshot,
+  embedStore,
+} from './embed-context'
+import { EmbeddedOutput, EmbeddedOutputLimitError } from './embed-output'
+import type { V2OperationName } from './generated/v2-api'
+import {
+  formatApiErrorDetails,
+  isRequestTimeout,
+  RAISE_TIMEOUT_HINT,
+  SimApiError,
+  SimClient,
+} from './http/client'
+import { writeStderr, writeStdout } from './output/io'
+import { sanitize } from './output/render'
+import { buildProgram } from './program'
+import { calledOperations } from './runtime/called-operations'
+import { commandPath } from './runtime/derive'
+
+/**
+ * In-process execution of one CLI invocation, for a server that already knows
+ * who is calling: the caller supplies endpoint + credential + workspace
+ * directly and the profile machinery (config files, env vars, login state) is
+ * bypassed entirely. Everything else — command tree, flag parsing, request
+ * building, output rendering — is the exact code the installed CLI runs, so
+ * the two surfaces cannot drift.
+ *
+ * Concurrency-safe by construction: the identity and the output capture both
+ * live in an AsyncLocalStorage context, so parallel embedded invocations (and
+ * any ordinary console logging around them) never interleave.
+ */
+
+export type { EmbeddedCliIdentity, EmbeddedFileSnapshot } from './embed-context'
+export { STILL_RUNNING_EXIT_CODE } from './exit-codes'
+export type {
+  ExportWorkflowResponse,
+  ListFilesResponse,
+  ListWorkflowsResponse,
+  ReadFileTextResponse,
+  V2OperationName,
+} from './generated/v2-api'
+export { SimApiError, SimClient } from './http/client'
+
+export interface EmbeddedCliResult {
+  exitCode: number
+  stdout: string
+  stderr: string
+}
+
+/**
+ * A typed v2 client bound to an embedded identity — for server-side augmentation
+ * commands that reuse the v2 surface directly instead of re-parsing rendered
+ * CLI output. Same endpoint/credential semantics as {@link runEmbeddedCli}.
+ */
+export function createEmbeddedClient(identity: EmbeddedCliIdentity): SimClient {
+  return new SimClient({
+    name: 'embedded',
+    authProfile: 'embedded',
+    oauth: null,
+    endpoint: identity.endpoint,
+    apiKey: identity.apiKey,
+    workspaceId: identity.workspaceId ?? null,
+    output: 'json',
+    ...(identity.transport ? { transport: identity.transport } : {}),
+    ...(identity.signal ? { signal: identity.signal } : {}),
+    sources: { endpoint: 'flag', credential: 'flag', workspaceId: 'flag', output: 'flag' },
+  })
+}
+
+/**
+ * Runs one CLI invocation in-process. `argv` is the token list exactly as the
+ * terminal would receive it (no leading node/binary tokens). Errors the
+ * installed CLI would print-and-exit on come back the same way: rendered to
+ * stderr with the same exit code — never thrown.
+ */
+export async function runEmbeddedCli(
+  argv: string[],
+  identity: EmbeddedCliIdentity,
+  options?: {
+    workingDirectory?: string
+    readFile?: EmbedContext['readFile']
+    openFile?: EmbedContext['openFile']
+    writeFile?: EmbedContext['writeFile']
+  }
+): Promise<EmbeddedCliResult> {
+  /** Multiple structured flags may consume the same file within one invocation. */
+  const reads = new Map<string, Promise<string | Uint8Array>>()
+  const snapshots = new Map<string, Promise<EmbeddedFileSnapshot>>()
+  const reader = options?.readFile
+  const opener = options?.openFile
+  const ctx: EmbedContext = {
+    identity,
+    ...(options?.workingDirectory ? { workingDirectory: options.workingDirectory } : {}),
+    stdout: new EmbeddedOutput(),
+    stderr: new EmbeddedOutput(),
+    ...(reader
+      ? {
+          readFile: (path: string) => {
+            let read = reads.get(path)
+            if (!read) {
+              read = reader(path)
+              reads.set(path, read)
+            }
+            return read
+          },
+        }
+      : {}),
+    ...(opener
+      ? {
+          openFile: (path: string) => {
+            let opened = snapshots.get(path)
+            if (!opened) {
+              opened = opener(path).then((file) => {
+                let disposed: Promise<void> | undefined
+                return {
+                  size: file.size,
+                  ...(file.signal ? { signal: file.signal } : {}),
+                  stream: () => file.stream(),
+                  dispose: () => (disposed ??= file.dispose()),
+                }
+              })
+              snapshots.set(path, opened)
+            }
+            return opened
+          },
+        }
+      : {}),
+    ...(options?.writeFile ? { writeFile: options.writeFile } : {}),
+  }
+  return embedStore.run(ctx, async () => {
+    let exitCode = 0
+    try {
+      identity.signal?.throwIfAborted()
+      const program = buildEmbeddedProgram({ writeOut: writeStdout, writeErr: writeStderr })
+      await program.parseAsync(argv, { from: 'user' })
+      // Commands that soft-fail (a failed run outcome, wait timeout) report through the
+      // context via setSoftExitCode — never process.exitCode, which is shared and raced
+      // between parallel embedded invocations.
+      if (ctx.softExitCode !== undefined && ctx.softExitCode !== 0) exitCode = ctx.softExitCode
+    } catch (error) {
+      exitCode = renderEmbeddedError(ctx, error)
+    } finally {
+      /** Includes argument/admission failures after opening a snapshot but before uploading. */
+      await Promise.all(
+        [...snapshots.values()].map(async (opened) => {
+          const file = await opened.catch(() => undefined)
+          if (file) {
+            await file.dispose().catch(() => {
+              ctx.stderr.diagnostic(
+                'Warning: temporary upload-file cleanup could not be confirmed.'
+              )
+            })
+          }
+        })
+      )
+    }
+    const limitError = ctx.stdout.limitError ?? ctx.stderr.limitError
+    const stderr = ctx.stderr.text()
+    return {
+      exitCode: limitError ? 1 : exitCode,
+      stdout: ctx.stdout.text(),
+      stderr: limitError ? `Error: ${limitError.message}\n${stderr}` : stderr,
+    }
+  })
+}
+
+/** Mirrors the installed CLI's top-level error handling (src/index.ts), minus process.exit. */
+function renderEmbeddedError(ctx: EmbedContext, error: unknown): number {
+  if (error instanceof EmbeddedOutputLimitError) return 1
+  if (error instanceof EmbeddedExit) return error.code
+  if (error instanceof CommanderError) {
+    // commander's CommanderError from exitOverride: usage/parse errors already
+    // printed through the (captured) output; help/version exit 0.
+    if (error.code === 'commander.helpDisplayed' || error.code === 'commander.version') {
+      return 0
+    }
+    return error.exitCode || 1
+  }
+  if (error instanceof ProfileConfigError) {
+    ctx.stderr.diagnostic(`Error: ${sanitize(error.message)}`)
+    return 1
+  }
+  if (isRequestTimeout(error)) {
+    ctx.stderr.diagnostic(`Error: the request timed out. ${RAISE_TIMEOUT_HINT}`)
+    return 1
+  }
+  if (error instanceof SimApiError) {
+    ctx.stderr.diagnostic(`Error: ${sanitize(error.message)}`)
+    if (error.code) ctx.stderr.diagnostic(`  code: ${sanitize(error.code)}`)
+    if (error.details !== undefined) {
+      for (const line of formatApiErrorDetails(error.details)) ctx.stderr.diagnostic(sanitize(line))
+    }
+    return error.exitCode
+  }
+  ctx.stderr.diagnostic(`Error: ${sanitize(getErrorMessage(error))}`)
+  return 1
+}
+
+function buildEmbeddedProgram(output: OutputConfiguration): Command {
+  const program = buildProgram({
+    hostCommands: false,
+    helpText: 'The embedding application supplies authentication, endpoint and workspace scope.',
+  })
+  configureEmbeddedOutput(program, output)
+  return program
+}
+
+/** Independently constructed subcommands do not inherit Commander output or exit overrides. */
+function configureEmbeddedOutput(command: Command, output: OutputConfiguration): void {
+  command.configureOutput(output)
+  command.exitOverride()
+  for (const child of command.commands) configureEmbeddedOutput(child, output)
+}
+
+/** Carries the command a parse dispatched to out of the parse, before its action runs. */
+class DispatchedCommand {
+  constructor(readonly command: Command) {}
+}
+
+const DISCARD_OUTPUT: OutputConfiguration = { writeOut: () => {}, writeErr: () => {} }
+
+interface EmbeddedCliCommand {
+  /** The command's canonical path (`['workflows', 'deploy']`), aliases resolved. */
+  path: string[]
+  /** Every v2 operation it may call: a command reaches only those it declares (`connect`). */
+  operations: readonly V2OperationName[]
+}
+
+/**
+ * The command `argv` runs under {@link runEmbeddedCli}, resolved by the same command
+ * tree and parser and stopped before any action runs.
+ *
+ * Null when the parse ends without dispatching (help, a usage error), which calls
+ * nothing. Undefined when the parse could not be followed to an answer, so a caller
+ * deciding whether to stop for consent can fail closed.
+ */
+export function resolveEmbeddedCliCommand(argv: string[]): EmbeddedCliCommand | null | undefined {
+  try {
+    const program = buildEmbeddedProgram(DISCARD_OUTPUT)
+    program.hook('preAction', (_program, action) => {
+      throw new DispatchedCommand(action)
+    })
+    program.parse(argv, { from: 'user' })
+  } catch (error) {
+    if (error instanceof DispatchedCommand) {
+      return {
+        path: commandPath(error.command),
+        operations: calledOperations(error.command) ?? [],
+      }
+    }
+    if (error instanceof CommanderError) return null
+  }
+  return undefined
+}

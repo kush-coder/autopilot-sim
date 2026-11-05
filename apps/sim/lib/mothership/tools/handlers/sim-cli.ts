@@ -1,0 +1,86 @@
+import { createLogger } from '@sim/logger'
+import { getErrorMessage } from '@sim/utils/errors'
+import { STILL_RUNNING_EXIT_CODE } from 'sim/embed'
+import { executeAgentCliRequest } from '@/lib/mothership/agent-cli'
+import { messageForCopilotApplicationError } from '@/lib/mothership/application/errors'
+import { AgentCliRequest } from '@/lib/mothership/generated/agent-cli'
+import type {
+  ToolExecutionContext,
+  ToolExecutionResult,
+} from '@/lib/mothership/tool-executor/types'
+
+const logger = createLogger('MothershipSimCli')
+
+/**
+ * The worker's `sim_cli` tool defers here. The frame carries the worker's typed request
+ * (`request`) beside the model's raw argv (`args`, kept for display and the log); only
+ * the request is executed — this side never re-parses tokens. The worker folds
+ * exitCode/stdout/stderr into the model window and applies its own output budget.
+ * A wait whose `--wait-timeout` elapsed with the work still going settles the call as
+ * done: the worker continues it in further calls, so the chat, the tool record and the
+ * tool metrics must not read it as a failure.
+ */
+export async function executeSimCli(
+  params: Record<string, unknown>,
+  context: ToolExecutionContext
+): Promise<ToolExecutionResult> {
+  const parsed = AgentCliRequest.safeParse(params.request)
+  if (!parsed.success) {
+    return {
+      success: false,
+      error: 'sim_cli requires the worker-built request; the invocation was not translated.',
+    }
+  }
+  if (!context.workspaceId && !context.organizationId) {
+    return { success: false, error: 'sim_cli requires a workspace-scoped execution context.' }
+  }
+  try {
+    const result = await executeAgentCliRequest(parsed.data, {
+      workspaceId: context.workspaceId,
+      organizationId: context.organizationId,
+      chatOrganizationId: context.chatOrganizationId,
+      userId: context.userId,
+      chatId: context.chatId,
+      signal: context.abortSignal,
+      toolCallId: context.toolCallId,
+      copilotToolExecution: context.copilotToolExecution,
+      copilotResourceAdmission: context.copilotResourceAdmission,
+      copilotInteractionMode: context.copilotInteractionMode,
+      executorDelegationOrigin: context.executorDelegationOrigin,
+      mcpBlockId: context.mcpBlockId,
+      boundWorkflowExecutionId: context.boundWorkflowExecutionId,
+      requestMode: context.requestMode,
+      searchSurface: context.searchSurface,
+      assistantSearch: context.assistantSearch,
+      billingAttribution: context.billingAttribution,
+      executionId: context.executionId,
+      messageId: context.messageId,
+      parentToolCallId: context.parentToolCallId,
+      userPermission: context.userPermission,
+      secretActorUserId: context.secretActorUserId,
+      resolvedSecretTraceRegistry: context.resolvedSecretTraceRegistry,
+      readOnly: context.benchmark === 'distill',
+    })
+    logger.info('CLI invocation finished', {
+      exitCode: result.exitCode,
+      lane: parsed.data.invocation.kind,
+      sink: parsed.data.sink?.kind ?? 'none',
+      stdoutBytes: result.stdout.length,
+    })
+    if (result.exitCode === 0 || result.exitCode === STILL_RUNNING_EXIT_CODE)
+      return { success: true, output: result }
+    return {
+      success: false,
+      output: result,
+      error: result.stderr.split('\n')[0] || `sim CLI exited with code ${result.exitCode}`,
+    }
+  } catch (error) {
+    return {
+      success: false,
+      error:
+        parsed.data.invocation.kind === 'service' || parsed.data.invocation.kind === 'stdout'
+          ? messageForCopilotApplicationError(error)
+          : getErrorMessage(error),
+    }
+  }
+}

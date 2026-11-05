@@ -1,0 +1,171 @@
+import { describePrincipalAuth, type SessionPrincipal } from '@sim/auth/principal'
+import { setRequestAuth } from '@sim/logger'
+import { NextResponse } from 'next/server'
+import {
+  methodMatchesContract,
+  requireBinaryRouteDefinition,
+} from '@/lib/api/server/routes/definition'
+import {
+  type InternalErrorPolicy,
+  type InternalRateLimitPolicy,
+  InternalUnauthenticatedError,
+  internalErrorResponse,
+  type internalSessionAuth,
+} from '@/lib/api/server/routes/internal-json-route'
+import { responseWithRequestId, withRequestId } from '@/lib/api/server/routes/request-id'
+import type {
+  BinaryApiRouteContract,
+  BinaryResponseDescriptor,
+  JsonErrorResponseDescriptor,
+  JsonNextRouteHandler,
+  JsonRouteContext,
+  NoContentResponseDescriptor,
+} from '@/lib/api/server/routes/types'
+import type { ParsedRequest, ParseRequestOptions } from '@/lib/api/server/validation'
+import { parseRequest } from '@/lib/api/server/validation'
+import type { ApplicationOperation, OperationUseCase } from '@/lib/core/application'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
+
+interface InternalBinaryRouteDefinition<
+  C extends BinaryApiRouteContract,
+  O extends ApplicationOperation,
+  I,
+  R,
+> {
+  contract: C
+  operation: O
+  mapInput(input: ParsedRequest<C>): I
+  useCase: OperationUseCase<NoInfer<O>, I, R>
+  present(
+    result: R
+  ):
+    | BinaryResponseDescriptor
+    | NoContentResponseDescriptor
+    | Promise<BinaryResponseDescriptor | NoContentResponseDescriptor>
+}
+
+interface InternalBinaryRouteOptions<
+  C extends BinaryApiRouteContract,
+  O extends ApplicationOperation,
+  I,
+  R,
+> extends InternalBinaryRouteDefinition<C, O, I, R> {
+  auth: typeof internalSessionAuth
+  rateLimit: InternalRateLimitPolicy
+  errorPolicy: InternalErrorPolicy
+  parseOptions?: Pick<ParseRequestOptions, 'maxBodyBytes'>
+  headSafe?: boolean
+  onSuccess?(args: { principal: SessionPrincipal; input: I; result: R }): void | Promise<void>
+}
+
+/**
+ * Defines an authenticated internal binary route, including streamed responses.
+ *
+ * The descriptor keeps storage and archive details out of the route handler while
+ * allowing a use-case presenter to return a Web Stream without buffering it.
+ */
+export function defineInternalBinaryRoute<
+  C extends BinaryApiRouteContract,
+  O extends ApplicationOperation,
+  I,
+  R,
+>(options: InternalBinaryRouteOptions<C, O, I, R>): JsonNextRouteHandler {
+  const { successStatus, successStatuses } = requireBinaryRouteDefinition(
+    options.contract,
+    options.operation,
+    options.useCase.operation
+  )
+
+  if (options.headSafe === false && typeof options.useCase.authorize !== 'function') {
+    throw new Error('A binary route with headSafe: false requires an authorize phase')
+  }
+
+  const wrapped = withRouteHandler<JsonRouteContext | undefined>(
+    async (request, context) => {
+      if (!methodMatchesContract(request.method, options.contract.method)) {
+        throw new Error(
+          `Route received ${request.method} for ${options.contract.method} contract ${options.contract.path}`
+        )
+      }
+
+      let principal: SessionPrincipal
+      try {
+        principal = await options.auth.authenticate()
+      } catch (error) {
+        if (error instanceof InternalUnauthenticatedError) {
+          return createJsonErrorResponse(internalErrorResponse(401, { error: error.message }))
+        }
+        throw error
+      }
+      setRequestAuth(describePrincipalAuth(principal))
+
+      const rateLimitResponse = await options.rateLimit.enforce(request, principal)
+      if (rateLimitResponse) return responseWithRequestId(rateLimitResponse)
+      const parsed = await parseRequest(
+        options.contract,
+        request,
+        context ?? {},
+        options.parseOptions
+      )
+      if (!parsed.success) return responseWithRequestId(parsed.response)
+
+      try {
+        const input = options.mapInput(parsed.data)
+        if (request.method === 'HEAD' && options.headSafe === false) {
+          if (!options.useCase.authorize) throw new Error('Missing HEAD authorization phase')
+          await options.useCase.authorize({ principal, input, request })
+          return new NextResponse(null, {
+            status: successStatus,
+            headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' },
+          })
+        }
+        const result = await options.useCase.execute({ principal, input, request })
+        const descriptor = await options.present(result)
+        await options.onSuccess?.({ principal, input, result })
+        if ('status' in descriptor) {
+          if (!successStatuses.includes(descriptor.status)) {
+            throw new Error(
+              `Internal binary route produced undeclared success status ${descriptor.status}; expected ${successStatuses.join(', ')}`
+            )
+          }
+          return new NextResponse(null, { status: descriptor.status, headers: descriptor.headers })
+        }
+        const headers = new Headers(descriptor.headers)
+        headers.set('Content-Type', descriptor.contentType)
+        if (descriptor.contentDisposition) {
+          headers.set('Content-Disposition', descriptor.contentDisposition)
+        }
+        if (descriptor.contentLength !== undefined) {
+          headers.set('Content-Length', String(descriptor.contentLength))
+        }
+        return new NextResponse(descriptor.body, { status: successStatus, headers })
+      } catch (error) {
+        const response = options.errorPolicy.project(error)
+        if (response) return createJsonErrorResponse(response)
+        throw error
+      }
+    },
+    {
+      typedErrorResponse: ({ error, status, requestId }) =>
+        NextResponse.json({ error: error.message, requestId }, { status }),
+      unhandledErrorResponse: ({ requestId }) =>
+        NextResponse.json({ error: 'Internal server error', requestId }, { status: 500 }),
+    }
+  )
+
+  return async (request, context) => {
+    const response = await wrapped(request, context)
+    if (response.status >= 400) {
+      response.headers.set('Cache-Control', 'private, no-store')
+      response.headers.set('X-Content-Type-Options', 'nosniff')
+    }
+    return response
+  }
+}
+
+function createJsonErrorResponse(descriptor: JsonErrorResponseDescriptor): NextResponse {
+  return NextResponse.json(withRequestId(descriptor.body), {
+    status: descriptor.status,
+    headers: descriptor.headers,
+  })
+}

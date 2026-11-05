@@ -1,0 +1,16 @@
+{
+  "extends": ["//"],
+  "tasks": {
+    "ci:runtime": {
+      "inputs": ["$TURBO_EXTENDS$", "!e2e-durations.json"]
+    },
+    "build": {
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/apps/sim/app/_styles/**",
+        "$TURBO_ROOT$/apps/sim/postcss.config.mjs",
+        "$TURBO_ROOT$/apps/sim/lib/postcss/**"
+      ]
+    }
+  }
+}

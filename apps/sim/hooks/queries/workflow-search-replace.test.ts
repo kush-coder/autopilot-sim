@@ -1,0 +1,104 @@
+import { describe, expect, it } from 'vitest'
+import type { WorkflowSearchMatch } from '@/lib/workflows/search-replace/types'
+import {
+  buildWorkflowSearchMcpToolReplacementOptions,
+  workflowSearchFileLookups,
+} from '@/hooks/queries/workflow-search-replace'
+
+function createMcpToolMatch(serverId?: string): WorkflowSearchMatch {
+  return {
+    id: serverId ? `match-${serverId}` : 'match-all',
+    blockId: 'mcp-1',
+    blockName: 'MCP',
+    blockType: 'mcp',
+    subBlockId: 'tool',
+    canonicalSubBlockId: 'tool',
+    subBlockType: 'mcp-tool-selector',
+    valuePath: [],
+    target: { kind: 'subblock' },
+    kind: 'mcp-tool',
+    rawValue: serverId ? `${serverId}-search` : 'search',
+    searchText: 'Search',
+    editable: true,
+    navigable: true,
+    protected: false,
+    resource: {
+      kind: 'mcp-tool',
+      key: serverId ? `${serverId}-search` : 'search',
+      selectorContext: serverId ? { mcpServerId: serverId } : undefined,
+      resourceGroupKey: serverId ? `mcp-tool:${serverId}` : 'mcp-tool:any',
+    },
+  }
+}
+
+describe('buildWorkflowSearchMcpToolReplacementOptions', () => {
+  const tools = [
+    {
+      id: 'a-search',
+      name: 'search',
+      serverId: 'server-a',
+      serverName: 'Server A',
+      inputSchema: {},
+    },
+    {
+      id: 'b-search',
+      name: 'search',
+      serverId: 'server-b',
+      serverName: 'Server B',
+      inputSchema: {},
+    },
+  ]
+
+  it('filters MCP tool replacement options to the matched server context', () => {
+    const options = buildWorkflowSearchMcpToolReplacementOptions(
+      [createMcpToolMatch('server-a')],
+      tools
+    )
+
+    expect(options).toEqual([
+      {
+        kind: 'mcp-tool',
+        value: 'mcp-server-a-search',
+        label: 'Server A: search',
+        resourceGroupKey: 'mcp-tool:server-a',
+      },
+    ])
+  })
+})
+
+describe('workflowSearchFileLookups', () => {
+  it('looks a value up only as what it can be', () => {
+    expect(
+      workflowSearchFileLookups([
+        'wf_abc',
+        'notes.md',
+        'docs/notes.md',
+        'workspace/ws-1/1731-ab-doc.md',
+        '/api/files/serve/workspace%2Fws-1%2F1731-ab-img.png?context=workspace',
+      ])
+    ).toEqual({
+      references: ['wf_abc', 'notes.md', 'docs/notes.md', 'workspace/ws-1/1731-ab-doc.md'],
+      keyValues: [
+        'docs/notes.md',
+        'workspace/ws-1/1731-ab-doc.md',
+        'workspace/ws-1/1731-ab-img.png',
+      ],
+    })
+  })
+
+  it('leaves a serve path with malformed percent-encoding unresolved instead of throwing', () => {
+    expect(workflowSearchFileLookups(['/api/files/serve/workspace%2Fws-1%2F%E0%A4%A.png'])).toEqual(
+      {
+        references: [],
+        keyValues: [],
+      }
+    )
+  })
+
+  it('looks a name or path holding `?` or `#` up by reference, never as a serve URL', () => {
+    expect(workflowSearchFileLookups(['what?.md', 'docs/q&a #1?.md'])).toEqual({
+      references: ['what?.md', 'docs/q&a #1?.md'],
+      keyValues: ['docs/q&a #1?.md'],
+    })
+  })
+})

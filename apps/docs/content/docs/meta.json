@@ -1,0 +1,36 @@
+{
+  "title": "Sim documentation",
+  "pages": [
+    "---Get started---",
+    "./introduction/index",
+    "./getting-started/index",
+    "./desktop/index",
+    "./browser-extension/index",
+    "---Sim Search---",
+    "search",
+    "---Build---",
+    "chat",
+    "workflows",
+    "agents",
+    "---Workspace---",
+    "knowledgebase",
+    "tables",
+    "files",
+    "logs-debugging",
+    "---Administration---",
+    "platform",
+    "platform/enterprise",
+    "platform/self-hosting",
+    "---Reference---",
+    "integrations",
+    "./quick-reference/index",
+    "./keyboard-shortcuts/index"
+  ],
+  "defaultOpen": false,
+  "labels": {
+    "./desktop/index": "Desktop",
+    "./browser-extension/index": "Browser extension",
+    "search": "Overview",
+    "logs-debugging": "Logs and debugging"
+  }
+}

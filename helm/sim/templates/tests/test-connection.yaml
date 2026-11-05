@@ -1,0 +1,64 @@
+{{- if .Values.tests.enabled }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "sim.fullname" . }}-test-connection
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sim.labels" . | nindent 4 }}
+    app.kubernetes.io/component: test
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  {{- with .Values.tests.image.pullSecrets }}
+  imagePullSecrets:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    runAsGroup: 65534
+    fsGroup: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: probe
+      image: {{ include "sim.image" (dict "imageRoot" .Values.tests.image "global" .Values.global "chartAppVersion" .Chart.AppVersion) }}
+      imagePullPolicy: {{ .Values.tests.image.pullPolicy }}
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        runAsNonRoot: true
+        runAsUser: 65534
+        capabilities:
+          drop:
+            - ALL
+      command:
+        - sh
+        - -c
+        - |
+          set -eu
+          # A pod turns Ready before every node routes its Service to it, so a
+          # probe sent the moment `helm install --wait` returns can be refused.
+          # Each URL is retried until a minute has passed, then the test fails.
+          probe() {
+            deadline=$(($(date +%s) + 60))
+            while ! wget -q -T {{ .Values.tests.timeoutSeconds }} --spider "$1"; do
+              if [ "$(date +%s)" -ge "$deadline" ]; then
+                echo "FAILED: $1 did not answer within 60s"
+                return 1
+              fi
+              echo "$1 did not answer; retrying in 5s"
+              sleep 5
+            done
+            echo "OK: $1"
+          }
+          probe "http://{{ include "sim.fullname" . }}-app:{{ .Values.app.service.port }}/"
+          {{- if .Values.realtime.enabled }}
+          probe "http://{{ include "sim.fullname" . }}-realtime:{{ .Values.realtime.service.port }}/health"
+          {{- end }}
+      resources:
+        {{- toYaml .Values.tests.resources | nindent 8 }}
+{{- end }}

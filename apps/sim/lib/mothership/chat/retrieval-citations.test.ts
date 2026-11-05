@@ -1,0 +1,76 @@
+import { describe, expect, it } from 'vitest'
+import { compactRetrievalCitations } from '@/lib/mothership/chat/retrieval-citations'
+
+describe('persisted retrieval citations', () => {
+  it('bounds display evidence and discards the rest of the tool output', () => {
+    const result = compactRetrievalCitations('search_workspace', {
+      success: true,
+      data: {
+        results: Array.from({ length: 100 }, (_, i) => ({
+          citationId: `document:${i}`,
+          citationUrl: 'https://example.test/doc',
+          content: 'x'.repeat(4000),
+          secret: 'drop',
+          documentId: 'drop',
+        })),
+        private: 'drop',
+      },
+    })
+    const json = JSON.stringify(result)
+    expect(json).not.toContain('secret')
+    expect(json).not.toContain('private')
+    expect(json).not.toContain('documentId')
+    expect(json.match(/citationId/g)).toHaveLength(50)
+    expect(json).not.toContain('x'.repeat(501))
+  })
+  it('does not retain failed or unrelated tool data', () => {
+    expect(compactRetrievalCitations('call_integration_tool', { token: 'private' })).toBeUndefined()
+    expect(
+      compactRetrievalCitations('read_document', {
+        success: false,
+        data: { citationId: 'a', citationUrl: 'https://example.test' },
+      })
+    ).toBeUndefined()
+  })
+  it('keeps only a partial-coverage marker, and keeps it through re-compaction', () => {
+    const compact = compactRetrievalCitations('search_workspace', {
+      success: true,
+      data: { results: [], retrieval: { status: 'partial', timedOutLegs: ['vector', 'keyword'] } },
+    })
+    expect(compact).toEqual({
+      success: true,
+      data: { results: [], retrieval: { status: 'partial' } },
+    })
+    expect(compactRetrievalCitations('search_workspace', compact)).toEqual(compact)
+    expect(
+      compactRetrievalCitations('search_workspace', {
+        success: true,
+        data: { results: [], retrieval: { status: 'complete', timedOutLegs: [] } },
+      })
+    ).toEqual({ success: true, data: { results: [] } })
+  })
+  it('keeps cited web pages as bounded citations and drops uncited web research entirely', () => {
+    const page = { title: 'Guide', url: 'https://docs.example.test/guide', text: 'y'.repeat(4000) }
+    expect(
+      compactRetrievalCitations('web_fetch', {
+        results: [{ ...page, citationId: 'web:guide', links: ['https://drop.test'] }],
+        notice: 'drop',
+      })
+    ).toEqual({
+      success: true,
+      data: {
+        results: [
+          {
+            citationId: 'web:guide',
+            citationUrl: 'https://docs.example.test/guide',
+            documentName: 'Guide',
+          },
+        ],
+      },
+    })
+    expect(
+      compactRetrievalCitations('web_search', { query: 'guide', results: [page] })
+    ).toBeUndefined()
+    expect(compactRetrievalCitations('web_search', { error: 'Search failed' })).toBeUndefined()
+  })
+})
